@@ -1,18 +1,13 @@
 
-import io
 import os
 import re
 import sqlite3
-import tempfile
-from typing import Dict, List
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
-# ----------------- Postavke stranice -----------------
-st.set_page_config(page_title="Rezultati – prazna app (Excel upload)", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Rezultati – HK Podravka", page_icon="🥇", layout="wide")
 
-# (Opcionalno) zaštita lozinkom preko Secrets; ako nije postavljena, ne traži lozinku
+# -------- 1) Zaštita lozinkom --------
 def check_auth():
     expected = st.secrets.get("APP_PASSWORD", os.environ.get("APP_PASSWORD", ""))
     if not expected:
@@ -33,89 +28,53 @@ def check_auth():
 
 check_auth()
 
-# ----------------- Helperi -----------------
+# -------- 2) Pomoćne funkcije --------
 def slugify(name: str) -> str:
     n = name.strip().lower()
     n = re.sub(r"[^\w\s-]", "", n)
     n = re.sub(r"[\s\-]+", "_", n)
     return n
 
-def load_excel(bytes_data: bytes) -> Dict[str, pd.DataFrame]:
-    """Učitaj sve sheetove iz Excela u {sheet: DataFrame} i normaliziraj nazive stupaca."""
+@st.cache_data(show_spinner=False)
+def load_sqlite(db_path: str) -> dict:
+    """Učitaj sve tablice iz SQLite u dict {tablica: DataFrame}."""
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    data = {}
+    for t in tables:
+        try:
+            df = pd.read_sql(f"SELECT * FROM {t}", conn)
+            df.columns = [slugify(str(c)) for c in df.columns]
+            df["izvor_tablice"] = t
+            m = re.search(r"(20\d{2})", t)
+            df["godina"] = int(m.group(1)) if m else pd.NA
+            data[t] = df
+        except Exception as e:
+            st.warning(f"Ne mogu učitati tablicu {t}: {e}")
+    conn.close()
+    return data
+
+@st.cache_data(show_spinner=False)
+def excel_to_frames(bytes_data: bytes) -> dict:
+    """Učitaj Excel u dict {sheet: DataFrame} s normaliziranim nazivima stupaca."""
+    import io
     xls = pd.ExcelFile(io.BytesIO(bytes_data))
     data = {}
     for sheet in xls.sheet_names:
         df = xls.parse(sheet)
-        # očisti nazive stupaca
         df.columns = [slugify(str(c)) for c in df.columns]
+        df["izvor_tablice"] = slugify(sheet)
+        m = re.search(r"(20\d{2})", sheet)
+        df["godina"] = int(m.group(1)) if m else pd.NA
         data[slugify(sheet)] = df
     return data
 
-def union_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
-    """Sigurno spoji više tablica (union po svim stupcima)."""
-    if not frames:
-        return pd.DataFrame()
-    all_cols = sorted(set().union(*[f.columns for f in frames]))
-    aligned = [f.reindex(columns=all_cols) for f in frames]
-    return pd.concat(aligned, ignore_index=True)
-
-def unique_sorted(df: pd.DataFrame, col: str) -> List[str]:
-    """Jedinstvene vrijednosti sortirane kao tekst (sprječava miješane tipove)."""
-    if col and col in df.columns:
-        vals = df[col].dropna().astype(str).unique().tolist()
-        vals = [v for v in vals if v.strip()]
-        return sorted(vals, key=str)
-    return []
-
-def df_to_sqlite_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
-    """Spremi više DataFrameova u SQLite i vrati bytes datoteke."""
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
-        path = tmp.name
-    try:
-        conn = sqlite3.connect(path)
-        for name, df in tables.items():
-            df.to_sql(name, conn, if_exists="replace", index=False)
-        conn.close()
-        with open(path, "rb") as f:
-            content = f.read()
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-    return content
-
-# ----------------- UI: Upload -----------------
-st.sidebar.header("📁 Učitaj Excel")
-uploaded = st.sidebar.file_uploader("Excel (.xlsx)", type=["xlsx"])
-
-st.title("📄 Prazna aplikacija — učitaj Excel i radi s podacima")
-
-if not uploaded:
-    st.info("Učitaj svoj **.xlsx** (s više sheetova po želji). App će sve spojiti i omogućiti filtriranje te izvoz.")
-    st.stop()
-
-# Učitavanje Excela
-tables = load_excel(uploaded.getvalue())
-st.sidebar.success(f"Učitano listova: {len(tables)}")
-
-# Dodaj heuristički stupac 'godina' iz naziva sheeta (ako sadrži 20xx)
-frames = []
-for sheet_name, df in tables.items():
-    m = re.search(r"(20\d{2})", sheet_name)
-    df = df.copy()
-    df["izvor_tablice"] = sheet_name
-    df["godina"] = int(m.group(1)) if m else pd.NA
-    frames.append(df)
-
-df = union_frames(frames)
-
-if df.empty:
-    st.warning("Excel je prazan ili nisam mogao pročitati podatke.")
-    st.stop()
-
-# ----------------- Heuristika stupaca (ako postoje) -----------------
 def pick_col(df: pd.DataFrame, candidates) -> str | None:
+    """Vrati naziv prvog pronađenog stupca koji odgovara kandidatima."""
     cols = set(df.columns)
     for cand in candidates:
         for c in cols:
@@ -123,71 +82,125 @@ def pick_col(df: pd.DataFrame, candidates) -> str | None:
                 return c
     return None
 
-col_ime       = pick_col(df, ["ime", "ime_prezime", "sportas", "natjecatelj", "athlete", "competitor"])
-col_prezime   = pick_col(df, ["prezime", "surname", "last_name"])
-col_klub      = pick_col(df, ["klub", "club", "team"])
-col_kat       = pick_col(df, ["kategorija", "kat", "divizija", "uzrast", "age_group"])
-col_plasman   = pick_col(df, ["plasman", "mjesto", "place", "rank"])
-col_datum     = pick_col(df, ["datum", "date", "vrijeme", "datum_natjecanja"])
-col_natjecanje= pick_col(df, ["natjecanje", "turnir", "dogadaj", "event", "naziv_natjecanja", "priredba"])
+def union_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Sigurno spoji sve tablice (union po svim stupcima)."""
+    if not frames:
+        return pd.DataFrame()
+    all_cols = sorted(set().union(*[f.columns for f in frames]))
+    aligned = [f.reindex(columns=all_cols) for f in frames]
+    df = pd.concat(aligned, ignore_index=True)
+    return df
 
-# ----------------- Brzi sažetak -----------------
-with st.expander("📊 Sažetak", expanded=True):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Broj zapisa", len(df))
-    if "godina" in df.columns:
-        c2.metric("Godina (unikatno)", df["godina"].dropna().nunique())
-    if col_klub:
-        c3.metric("Klubova", df[col_klub].dropna().nunique())
-    if col_kat:
-        c4.metric("Kategorija", df[col_kat].dropna().nunique())
+def unique_sorted(df, col):
+    """Vrati sortirane jedinstvene vrijednosti kao stringove (sprječava TypeError)."""
+    if col and col in df.columns:
+        vals = df[col].dropna().astype(str).unique().tolist()
+        vals = [v for v in vals if v.strip() != ""]
+        return sorted(vals, key=str)
+    return []
 
-# ----------------- Filteri -----------------
+# -------- 3) Izvor podataka (baza ili upload Excel) --------
+st.sidebar.header("📁 Izvor podataka")
+default_db_path = "data/rezultati_baza.sqlite"
+use_uploaded = st.sidebar.toggle("Koristi učitani Excel umjesto baze", value=False)
+uploaded = st.sidebar.file_uploader("Učitaj Excel (.xlsx)", type=["xlsx"], disabled=not use_uploaded)
+
+if use_uploaded and uploaded is not None:
+    data_dict = excel_to_frames(uploaded.getvalue())
+else:
+    data_dict = load_sqlite(default_db_path)
+
+if not data_dict:
+    st.warning("Nema učitanih tablica. Učitaj Excel (gore lijevo) ili dodaj `rezultati_baza.sqlite` u folder `data/`.")
+    st.stop()
+
+st.sidebar.write(f"Učitano tablica: **{len(data_dict)}**")
+
+frames = list(data_dict.values())
+df = union_frames(frames)
+if df.empty:
+    st.warning("Nema podataka za prikaz.")
+    st.stop()
+
+# -------- 4) Heuristika stupaca --------
+col_ime = pick_col(df, ["ime", "ime_prezime", "sportas", "natjecatelj", "athlete", "competitor"])
+col_prezime = pick_col(df, ["prezime", "surname", "last_name"])
+col_klub = pick_col(df, ["klub", "club", "team"])
+col_kat = pick_col(df, ["kategorija", "kat", "divizija", "uzrast", "age_group"])
+col_datum = pick_col(df, ["datum", "date", "vrijeme", "datum_natjecanja"])
+col_bodovi = pick_col(df, ["bodovi", "bod", "points", "score"])
+col_medalja = pick_col(df, ["medalja", "medal", "medalja_tip"])
+col_plasman = pick_col(df, ["plasman", "mjesto", "place", "rank"])
+col_natjecanje = pick_col(df, ["natjecanje", "turnir", "dogadaj", "event", "naziv_natjecanja", "priredba", "competiton"])
+
+# -------- 5) Filteri --------
 st.sidebar.header("🔎 Filteri")
-q = st.sidebar.text_input("Pretraga (ime/prezime/naziv natjecanja)", placeholder="npr. Ana, Kovač…")
-godine = st.sidebar.multiselect("Godina", unique_sorted(df, "godina"), default=unique_sorted(df, "godina"))
-kat = st.sidebar.multiselect("Kategorija", unique_sorted(df, col_kat))
-klub = st.sidebar.multiselect("Klub", unique_sorted(df, col_klub))
+q = st.sidebar.text_input("Pretraga imena / prezimena", placeholder="npr. Ana, Kovač…")
+g_sel = sorted([g for g in df["godina"].dropna().unique().tolist()]) if "godina" in df.columns else []
+godine = st.sidebar.multiselect("Godina", g_sel, default=g_sel)
+
+kat_vals = unique_sorted(df, col_kat)
+kat = st.sidebar.multiselect("Kategorija", kat_vals, default=[])
+
+klub_vals = unique_sorted(df, col_klub)
+klub = st.sidebar.multiselect("Klub", klub_vals, default=[])
 
 fdf = df.copy()
 if "godina" in fdf.columns and godine:
-    fdf = fdf[fdf["godina"].astype(str).isin([str(g) for g in godine])]
+    fdf = fdf[fdf["godina"].isin(godine)]
 
-def contains_any(row: pd.Series, term: str) -> bool:
-    term = term.strip()
-    if not term:
-        return True
-    fields = []
-    for c in [col_ime, col_prezime, col_natjecanje]:
-        if c and c in row:
-            fields.append(str(row[c]) if pd.notna(row[c]) else "")
-    return any(term.lower() in s.lower() for s in fields)
+def contains_safe(series: pd.Series, term: str):
+    return series.fillna("").str.contains(term, case=False, na=False)
 
-if q:
-    fdf = fdf[fdf.apply(lambda r: contains_any(r, q), axis=1)]
+if q and (col_ime or col_prezime):
+    if col_ime and col_prezime and col_ime in fdf.columns and col_prezime in fdf.columns:
+        fdf = fdf[contains_safe(fdf[col_ime], q) | contains_safe(fdf[col_prezime], q)]
+    else:
+        name_cols = [c for c in [col_ime, col_prezime] if c in fdf.columns]
+        if name_cols:
+            mask = False
+            for c in name_cols:
+                mask = mask | contains_safe(fdf[c], q)
+            fdf = fdf[mask]
 
 if kat and col_kat in fdf.columns:
-    fdf = fdf[fdf[col_kat].astype(str).isin([str(x) for x in kat])]
-
+    fdf = fdf[fdf[col_kat].isin(kat)]
 if klub and col_klub in fdf.columns:
-    fdf = fdf[fdf[col_klub].astype(str).isin([str(x) for x in klub])]
+    fdf = fdf[fdf[col_klub].isin(klub)]
 
-# ----------------- Tablica -----------------
-st.subheader("📋 Podaci")
-priority = [c for c in [col_ime, col_prezime, col_klub, col_kat, col_plasman, col_natjecanje, col_datum, "godina", "izvor_tablice"] if c and c in fdf.columns]
-other = [c for c in fdf.columns if c not in priority]
-view_cols = priority + other
+# -------- 6) Prikaz --------
+st.title("🥇 Rezultati — pretraga i statistika")
+st.caption("HK Podravka • Brza pretraga po imenima, klubovima, kategorijama i godinama.")
+
+with st.expander("📊 Brza statistika", expanded=False):
+    left, right, right2 = st.columns(3)
+    left.metric("Broj zapisa", len(fdf))
+    if col_klub in fdf.columns:
+        right.metric("Broj klubova", fdf[col_klub].nunique())
+    if col_kat in fdf.columns:
+        right2.metric("Broj kategorija", fdf[col_kat].nunique())
+    if col_klub in fdf.columns and col_plasman in fdf.columns:
+        st.subheader("Poredak klubova po medaljama (1.–3.)")
+        md = fdf[fdf[col_plasman].astype(str).isin(["1", "2", "3"])]
+        tally = md.groupby([col_klub, col_plasman]).size().unstack(fill_value=0)
+        tally["ukupno"] = tally.sum(axis=1)
+        tally = tally.sort_values("ukupno", ascending=False)
+        st.dataframe(tally, use_container_width=True)
+
+st.subheader("📋 Rezultati")
+priority_cols = [c for c in [
+    col_ime, col_prezime, col_klub, col_kat, col_plasman, col_bodovi, col_medalja, col_natjecanje, col_datum, "godina", "izvor_tablice"
+] if c and c in fdf.columns]
+other_cols = [c for c in fdf.columns if c not in priority_cols]
+view_cols = priority_cols + other_cols
 st.dataframe(fdf[view_cols], use_container_width=True)
 
-# ----------------- Exporti -----------------
-st.subheader("⬇️ Izvoz")
-csv_bytes = fdf[view_cols].to_csv(index=False).encode("utf-8")
-st.download_button("Preuzmi filtrirane podatke (CSV)", data=csv_bytes, file_name="rezultati_filtrirano.csv", mime="text/csv")
+st.download_button(
+    "⬇️ Preuzmi filtrirane rezultate (CSV)",
+    data=fdf[view_cols].to_csv(index=False).encode("utf-8"),
+    file_name="filtrirani_rezultati.csv",
+    mime="text/csv",
+)
 
-# SQLite (svaki sheet ide u zasebnu tablicu; plus jedna 'sveukupno')
-tables_for_sqlite = {name: df for name, df in tables.items()}
-tables_for_sqlite["sveukupno"] = df
-sqlite_bytes = df_to_sqlite_bytes(tables_for_sqlite)
-st.download_button("Preuzmi SQLite bazu (iz ovog Excela)", data=sqlite_bytes, file_name="rezultati_iz_excela.sqlite", mime="application/octet-stream")
-
-st.caption("Ovo je minimalna verzija – nema trajnog spremanja na server. Svaki put učitaj Excel i po želji preuzmi CSV/SQLite.")
+st.sidebar.markdown("---")
+st.sidebar.caption("Pristup zaštićen lozinkom.")
